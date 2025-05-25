@@ -1,24 +1,14 @@
 // fantasy-frontend/src/lib/api/sleeper.ts
 
+import type {
+  LeagueDetails,
+  SleeperResolvedUser, // might need to move here
+  BasicSleeperLeague // might need to move here
+} from '@/types/sleeper';
+
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL;
 
-interface SleeperResolvedUser {
-  user_id: string;
-  display_name: string;
-  error?: string;
-}
 
-interface SleeperLeague {
-  league_id: string;
-  name: string;
-  season: string;
-  // Add other relevant league properties returned by your FastAPI endpoint
-}
-
-/**
- * Resolves a Sleeper username or ID to a validated user_id and display_name
- * by calling the FastAPI backend.
- */
 export const resolveSleeperInput = async (inputValue: string): Promise<SleeperResolvedUser | null> => {
   try {
     // Ensure API_BASE_URL is defined
@@ -75,5 +65,37 @@ export const fetchSleeperLeaguesForYear = async (userId: string, year: number): 
   } catch (error) {
     console.error('Failed to fetch Sleeper leagues:', error);
     return []; // Return empty array on error so the UI can handle it gracefully
+  }
+};
+
+/**
+ * Fetches detailed information for a specific Sleeper league_id
+ * by calling the FastAPI backend.
+ */
+export const fetchSleeperLeagueDetails = async (leagueId: string): Promise<LeagueDetails | null> => {
+  if (!API_BASE_URL) {
+    console.error("API base URL is not configured in fetchSleeperLeagueDetails.");
+    throw new Error("API base URL is not configured.");
+  }
+  if (!leagueId) {
+    console.error("League ID is required to fetch league details.");
+    return null;
+  }
+
+  const url = `${API_BASE_URL}/sleeper/league/${leagueId}/details`;
+  console.log("Attempting to fetch league details from URL:", url);
+
+  try {
+    const response = await fetch(url);
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({ detail: `HTTP error! status: ${response.status} and no JSON body` }));
+      console.error('Error fetching league details:', errorData?.detail || `HTTP error! status: ${response.status}`);
+      throw new Error(errorData?.detail || `HTTP error! status: ${response.status}`);
+    }
+    const data: LeagueDetails = await response.json();
+    return data;
+  } catch (error) {
+    console.error('Failed to fetch Sleeper league details:', error);
+    return null;
   }
 };

@@ -4,7 +4,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
 from contextlib import asynccontextmanager # For newer FastAPI (0.90.0+)
 from datetime import datetime
-from typing import Optional, List, Any # Added List, Any
+from typing import Optional, List, Any, Dict # Added List, Any
+import asyncio
 
 import httpx # Added for making HTTP requests
 
@@ -41,6 +42,35 @@ class SleeperLeagueResponseItem(BaseModel):
     # settings: Optional[Any] = None
     # roster_positions: Optional[List[str]] = None
     # scoring_settings: Optional[Dict[str, Any]] = None
+
+# --- New Pydantic Models for Detailed League Info ---
+class LeagueSettingDetails(BaseModel):
+    type: Optional[int] = None # 0: Redraft, 1: Keeper, 2: Dynasty etc.
+    # name: Optional[str] = None # This 'name' field in Sleeper settings is usually for specific settings like "Best Ball", not the league name itself
+    playoff_week_start: Optional[int] = None
+    # Add other relevant league settings from league_data.settings as needed
+    # e.g., taxi_slots: Optional[int] = None, reserve_slots: Optional[int] = None
+
+class RosterDetail(BaseModel):
+    roster_id: int
+    owner_id: Optional[str] = None
+    owner_display_name: Optional[str] = None
+    players: Optional[List[str]] = Field(default_factory=list) # List of player_ids
+    wins: Optional[int] = None
+    losses: Optional[int] = None
+    ties: Optional[int] = None
+    fpts: Optional[float] = None # Combined fantasy points for
+
+class LeagueDetailsResponse(BaseModel):
+    league_id: str
+    name: str
+    season: str
+    status: str # e.g., "in_season", "pre_season", "complete"
+    total_rosters: int
+    scoring_settings: Optional[Dict[str, Any]] = None
+    roster_positions: Optional[List[str]] = None
+    settings: Optional[LeagueSettingDetails] = None # Parsed league settings
+    rosters: List[RosterDetail] = []
 
 
 # Lifespan context manager for startup and shutdown events (recommended for FastAPI 0.90.0+)
@@ -239,6 +269,126 @@ async def get_sleeper_user_leagues(
         except Exception as e: # Catch-all for other errors, including JSON decoding if response isn't JSON
             print(f"Unexpected error fetching leagues: {e}")
             raise HTTPException(status_code=500, detail=f"An unexpected server error occurred: {str(e)}")
+
+@app.get("/api/v1/sleeper/league/{league_id}/details", response_model=LeagueDetailsResponse, tags=["Sleeper"])
+async def get_sleeper_league_details(
+        league_id: str = Path(..., description="The Sleeper league ID")
+):
+    """
+    Fetches detailed information for a specific Sleeper league,
+    including basic settings, rosters, and user display names.
+    """
+    async with httpx.AsyncClient() as client:
+        try:
+            # Concurrently fetch league data, rosters, and users
+            league_task = client.get(f"{SLEEPER_API_BASE_URL}/league/{league_id}")
+            rosters_task = client.get(f"{SLEEPER_API_BASE_URL}/league/{league_id}/rosters")
+            users_task = client.get(f"{SLEEPER_API_BASE_URL}/league/{league_id}/users")
+
+            league_response, rosters_response, users_response = await asyncio.gather(
+                league_task, rosters_task, users_task
+            )
+
+            # Check for errors in responses
+            league_response.raise_for_status()
+            rosters_response.raise_for_status()
+            users_response.raise_for_status()
+
+            league_data = league_response.json()
+            rosters_data = rosters_response.json() # This is a list of roster objects
+            users_data = users_response.json()     # This is a list of user objects for the league
+
+            # Create a mapping for user_id to display_name for efficient lookup
+            user_map = {user['user_id']: user.get('display_name', 'Unknown User') for user in users_data if user and 'user_id' in user}
+
+            # Prepare roster details
+            processed_rosters: List[RosterDetail] = []
+            if isinstance(rosters_data, list): # Ensure rosters_data is a list
+                for r_data in rosters_data:
+                    if not r_data or "roster_id" not in r_data: # Skip if roster data is malformed
+                        continue
+
+                    owner_id = r_data.get("owner_id")
+                    roster_settings = r_data.get("settings", {})
+
+                    # Calculate total fantasy points (fpts)
+                    # Sleeper provides fpts (integer part) and fpts_decimal (the decimal part as an integer)
+                    fantasy_points_for = roster_settings.get("fpts", 0)
+                    fantasy_points_for_decimal = roster_settings.get("fpts_decimal", 0)
+
+                    # Safely convert to float and combine
+                    calculated_fpts = 0.0
+                    try:
+                        base_fpts = float(fantasy_points_for) if fantasy_points_for is not None else 0.0
+                        decimal_fpts_val = float(fantasy_points_for_decimal) if fantasy_points_for_decimal is not None else 0.0
+
+                        # Determine number of decimal places for fpts_decimal (e.g., if 25 -> 0.25, if 5 -> 0.05)
+                        # Assuming it represents raw decimal values, e.g. 25 means 0.25.
+                        # A common way Sleeper represents this is fpts_decimal are the digits after decimal.
+                        # If fpts_decimal is 25 it's .25. If it's 5 it might mean .05 or .5.
+                        # For simplicity and robustness, we'll treat it as hundredths if non-zero.
+                        if decimal_fpts_val != 0:
+                            # This assumes fpts_decimal are the raw digits, e.g., 25 for .25
+                            # A common pattern is `fpts_decimal / (10 ** num_digits_in_fpts_decimal)`
+                            # For now, a simple division by 100 if non-zero.
+                            # Example: fpts: 100, fpts_decimal: 25 -> 100.25
+                            # Example: fpts: 100, fpts_decimal: 5 -> 100.05
+                            # Let's assume fpts_decimal should be scaled by 0.01
+                            calculated_fpts = base_fpts + (decimal_fpts_val / 100.0)
+                        else:
+                            calculated_fpts = base_fpts
+                    except (ValueError, TypeError):
+                        calculated_fpts = 0.0 # Fallback if conversion fails
+
+                    processed_rosters.append(
+                        RosterDetail(
+                            roster_id=r_data["roster_id"],
+                            owner_id=owner_id,
+                            owner_display_name=user_map.get(owner_id) if owner_id else "Team Available / CPU",
+                            players=r_data.get("players") if r_data.get("players") is not None else [],
+                            wins=roster_settings.get("wins"),
+                            losses=roster_settings.get("losses"),
+                            ties=roster_settings.get("ties"),
+                            fpts=calculated_fpts
+                        )
+                    )
+
+            # Prepare detailed league settings
+            api_league_settings = league_data.get("settings", {})
+            processed_league_settings = LeagueSettingDetails(
+                type=api_league_settings.get("type"),
+                playoff_week_start=api_league_settings.get("playoff_week_start")
+                # Map other settings from api_league_settings to LeagueSettingDetails as needed
+            )
+
+            return LeagueDetailsResponse(
+                league_id=league_data["league_id"],
+                name=league_data["name"],
+                season=league_data["season"],
+                status=league_data["status"],
+                total_rosters=league_data["total_rosters"],
+                scoring_settings=league_data.get("scoring_settings"),
+                roster_positions=league_data.get("roster_positions"),
+                settings=processed_league_settings,
+                rosters=processed_rosters
+            )
+
+        except httpx.HTTPStatusError as exc:
+            error_detail = f"Error from Sleeper API: {exc.response.status_code} for URL {exc.request.url}. Response: {exc.response.text}"
+            print(f"HTTPStatusError in get_sleeper_league_details: {error_detail}")
+            raise HTTPException(status_code=exc.response.status_code, detail=error_detail)
+        except httpx.RequestError as exc:
+            error_detail = f"Failed to connect to Sleeper API for URL {exc.request.url}: {exc}"
+            print(f"RequestError in get_sleeper_league_details: {error_detail}")
+            raise HTTPException(status_code=503, detail=error_detail)
+        except Exception as e:
+            # Log the full traceback for unexpected errors
+            import traceback
+            error_trace = traceback.format_exc()
+            error_detail = f"An unexpected server error occurred: {str(e)}"
+            print(f"Unexpected error in get_sleeper_league_details: {error_detail}\nTrace: {error_trace}")
+            raise HTTPException(status_code=500, detail=error_detail)
+
 
 
 # --- Placeholder for future player routes ---
